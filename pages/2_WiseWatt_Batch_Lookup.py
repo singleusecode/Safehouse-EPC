@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import io
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +44,8 @@ st.caption(
 DEFAULT_API_URL = "https://api.wisewatt.uk.cgi.com/api/v1"
 DEFAULT_REQUEST_TIMEOUT = 45
 DEFAULT_MAX_RETRIES = 3
-DEFAULT_REQUEST_DELAY = 0.25
+DEFAULT_REQUEST_DELAY = 0.0
+DEFAULT_MAX_WORKERS = 5
 
 ADDRESS_COLUMN = "ADDRESS"
 ELECTRIC_METER_COLUMN = "ELECTRIC METER"
@@ -248,6 +251,7 @@ def write_result(
     result: dict[str, Any],
     header_map: dict[str, int],
 ) -> None:
+    """Write one electricity or gas lookup result to the workbook."""
     if meter_type == "electricity":
         number_heading = "ELECTRICITY MPAN"
         status_heading = "ELECTRICITY STATUS"
@@ -287,6 +291,7 @@ def existing_meter_number(
     heading: str,
     header_map: dict[str, int],
 ) -> str:
+    """Return an existing MPAN or MPRN from the workbook, if present."""
     column = header_map.get(heading.upper())
     if not column:
         return ""
@@ -300,19 +305,42 @@ def existing_meter_number(
 # ============================================================
 
 def create_session(api_key: str) -> requests.Session:
+    """Create a configured WiseWatt HTTP session."""
     session = requests.Session()
     session.headers.update(
         {
             "wisewatt-api-key-token": api_key,
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "Safehouse-WiseWatt-Batch-Lookup/2.0",
+            "User-Agent": "Safehouse-WiseWatt-Batch-Lookup/3.0",
         }
     )
     return session
 
 
+_thread_local = threading.local()
+
+
+def get_thread_session(api_key: str) -> requests.Session:
+    """
+    Return one requests.Session per worker thread.
+
+    This allows each worker to reuse its HTTP connection without sharing a
+    requests.Session object across concurrent threads.
+    """
+    session = getattr(_thread_local, "session", None)
+    session_api_key = getattr(_thread_local, "api_key", None)
+
+    if session is None or session_api_key != api_key:
+        session = create_session(api_key)
+        _thread_local.session = session
+        _thread_local.api_key = api_key
+
+    return session
+
+
 def decode_response(response: requests.Response) -> dict[str, Any]:
+    """Decode a WiseWatt response safely."""
     try:
         payload = response.json()
     except ValueError:
@@ -338,6 +366,7 @@ def lookup_meter(
     request_timeout: int,
     max_retries: int,
 ) -> dict[str, Any]:
+    """Look up one electricity MPAN or gas MPRN."""
     payload = {
         "postCode": postcode,
         "addressIdentifier": address_identifier,
@@ -460,6 +489,44 @@ def lookup_meter(
     }
 
 
+def execute_lookup_task(
+    task: dict[str, Any],
+    api_key: str,
+    request_timeout: int,
+    max_retries: int,
+    request_delay: float,
+) -> dict[str, Any]:
+    """
+    Execute one lookup inside a worker thread.
+
+    The worker performs only the HTTP request. Workbook writes remain in the
+    main Streamlit thread.
+    """
+    session = get_thread_session(api_key)
+    started_at = time.perf_counter()
+
+    result = lookup_meter(
+        session=session,
+        postcode=task["postcode"],
+        address_identifier=task["address_identifier"],
+        meter_type=task["meter_type"],
+        request_timeout=request_timeout,
+        max_retries=max_retries,
+    )
+
+    elapsed_seconds = time.perf_counter() - started_at
+
+    if request_delay > 0:
+        time.sleep(request_delay)
+
+    return {
+        "row_number": task["row_number"],
+        "meter_type": task["meter_type"],
+        "result": result,
+        "elapsed_seconds": elapsed_seconds,
+    }
+
+
 # ============================================================
 # SIDEBAR
 # ============================================================
@@ -486,12 +553,29 @@ with st.sidebar:
             help="Used only for the current Streamlit session.",
         ).strip()
 
+    max_workers = st.number_input(
+        "Concurrent API requests",
+        min_value=1,
+        max_value=10,
+        value=DEFAULT_MAX_WORKERS,
+        step=1,
+        help=(
+            "Number of WiseWatt requests processed simultaneously. "
+            "Start with 3–5. Reduce this if the API returns rate-limit "
+            "or connection errors."
+        ),
+    )
+
     request_delay = st.number_input(
-        "Delay between API requests (seconds)",
+        "Delay after each API request (seconds)",
         min_value=0.0,
         max_value=5.0,
         value=DEFAULT_REQUEST_DELAY,
         step=0.05,
+        help=(
+            "Applied independently inside each worker after a request. "
+            "Normally leave this at 0 unless the API requires throttling."
+        ),
     )
 
     request_timeout = st.number_input(
@@ -586,18 +670,12 @@ ignored_empty_rows = (
 )
 
 metric1, metric2, metric3, metric4 = st.columns(4)
-metric1.metric(
-    "Meaningful rows",
-    len(preview_rows),
-)
+metric1.metric("Meaningful rows", len(preview_rows))
 metric2.metric(
     "Empty/formatted rows ignored",
     max(ignored_empty_rows, 0),
 )
-metric3.metric(
-    "Worksheet",
-    sheet_name,
-)
+metric3.metric("Worksheet", sheet_name)
 metric4.metric(
     "Detected final Excel row",
     preview_worksheet.max_row,
@@ -623,6 +701,8 @@ if not run_lookup:
 # PROCESS WORKBOOK
 # ============================================================
 
+batch_started_at = time.perf_counter()
+
 workbook = load_workbook(io.BytesIO(original_workbook_bytes))
 worksheet = workbook[sheet_name]
 header_map = ensure_output_columns(worksheet)
@@ -638,13 +718,13 @@ rows_to_process = find_rows_to_process(
     gas_flag_column,
 )
 
-session = create_session(api_key)
-
 progress_bar = st.progress(0.0)
 current_status = st.empty()
 live_log = st.empty()
 
 logs: list[str] = []
+lookup_tasks: list[dict[str, Any]] = []
+response_times: list[float] = []
 
 electricity_successes = 0
 gas_successes = 0
@@ -656,7 +736,16 @@ api_requests = 0
 
 total_rows = len(rows_to_process)
 
-for position, row_number in enumerate(rows_to_process, start=1):
+
+# ------------------------------------------------------------
+# PHASE 1: VALIDATE ROWS AND BUILD LOOKUP TASKS
+# ------------------------------------------------------------
+
+current_status.write(
+    f"Preparing {total_rows} meaningful workbook rows..."
+)
+
+for row_number in rows_to_process:
     full_address = worksheet.cell(
         row=row_number,
         column=address_column,
@@ -666,6 +755,7 @@ for position, row_number in enumerate(rows_to_process, start=1):
         row=row_number,
         column=electricity_flag_column,
     ).value
+
     gas_flag = worksheet.cell(
         row=row_number,
         column=gas_flag_column,
@@ -680,16 +770,12 @@ for position, row_number in enumerate(rows_to_process, start=1):
         "ELECTRICITY MPAN",
         header_map,
     )
+
     existing_mprn = existing_meter_number(
         worksheet,
         row_number,
         "GAS MPRN",
         header_map,
-    )
-
-    current_status.write(
-        f"Processing meaningful row {position} of {total_rows} "
-        f"(Excel row {row_number})"
     )
 
     address_identifier, postcode, parsing_error = parse_address(
@@ -701,14 +787,15 @@ for position, row_number in enumerate(rows_to_process, start=1):
         column=header_map["EXTRACTED ADDRESS IDENTIFIER"],
         value=address_identifier or "",
     )
+
     worksheet.cell(
         row=row_number,
         column=header_map["EXTRACTED POSTCODE"],
         value=postcode or "",
     )
 
-    # A row with only flags but no address is a genuine data error.
-    # Fully blank rows never reach this loop.
+    # Fully blank rows never enter this loop. A row that reaches this point
+    # with lookup flags but no usable address is therefore a genuine error.
     if parsing_error:
         if electricity_required:
             write_result(
@@ -716,6 +803,7 @@ for position, row_number in enumerate(rows_to_process, start=1):
                 row_number,
                 "electricity",
                 {
+                    "success": False,
                     "meter_number": existing_mpan,
                     "transaction_id": "",
                     "error_code": "ADDRESS_ERROR",
@@ -724,6 +812,21 @@ for position, row_number in enumerate(rows_to_process, start=1):
                 header_map,
             )
             failed_lookups += 1
+        else:
+            skipped_flags += 1
+            write_result(
+                worksheet,
+                row_number,
+                "electricity",
+                {
+                    "success": False,
+                    "meter_number": existing_mpan,
+                    "transaction_id": "",
+                    "error_code": "",
+                    "status": "Skipped – ELECTRIC METER is No/blank",
+                },
+                header_map,
+            )
 
         if gas_required:
             write_result(
@@ -731,6 +834,7 @@ for position, row_number in enumerate(rows_to_process, start=1):
                 row_number,
                 "gas",
                 {
+                    "success": False,
                     "meter_number": existing_mprn,
                     "transaction_id": "",
                     "error_code": "ADDRESS_ERROR",
@@ -739,6 +843,21 @@ for position, row_number in enumerate(rows_to_process, start=1):
                 header_map,
             )
             failed_lookups += 1
+        else:
+            skipped_flags += 1
+            write_result(
+                worksheet,
+                row_number,
+                "gas",
+                {
+                    "success": False,
+                    "meter_number": existing_mprn,
+                    "transaction_id": "",
+                    "error_code": "",
+                    "status": "Skipped – GAS METER is No/blank",
+                },
+                header_map,
+            )
 
         if electricity_required or gas_required:
             address_errors += 1
@@ -750,10 +869,7 @@ for position, row_number in enumerate(rows_to_process, start=1):
             logs.append(
                 f"Excel row {row_number}: skipped – no meter lookup flags"
             )
-            skipped_flags += 2
 
-        progress_bar.progress(position / total_rows)
-        live_log.code("\n".join(logs[-15:]), language=None)
         continue
 
     if electricity_required:
@@ -764,6 +880,7 @@ for position, row_number in enumerate(rows_to_process, start=1):
                 row_number,
                 "electricity",
                 {
+                    "success": True,
                     "meter_number": existing_mpan,
                     "transaction_id": "",
                     "error_code": "",
@@ -775,37 +892,14 @@ for position, row_number in enumerate(rows_to_process, start=1):
                 f"Excel row {row_number}: existing MPAN retained"
             )
         else:
-            result = lookup_meter(
-                session=session,
-                postcode=postcode,
-                address_identifier=address_identifier,
-                meter_type="electricity",
-                request_timeout=int(request_timeout),
-                max_retries=int(max_retries),
+            lookup_tasks.append(
+                {
+                    "row_number": row_number,
+                    "meter_type": "electricity",
+                    "postcode": postcode,
+                    "address_identifier": address_identifier,
+                }
             )
-            api_requests += 1
-            write_result(
-                worksheet,
-                row_number,
-                "electricity",
-                result,
-                header_map,
-            )
-
-            if result["success"]:
-                electricity_successes += 1
-                logs.append(
-                    f"Excel row {row_number}: MPAN "
-                    f"{result['meter_number']}"
-                )
-            else:
-                failed_lookups += 1
-                logs.append(
-                    f"Excel row {row_number}: electricity – "
-                    f"{result['status']}"
-                )
-
-            time.sleep(float(request_delay))
     else:
         skipped_flags += 1
         write_result(
@@ -813,6 +907,7 @@ for position, row_number in enumerate(rows_to_process, start=1):
             row_number,
             "electricity",
             {
+                "success": False,
                 "meter_number": existing_mpan,
                 "transaction_id": "",
                 "error_code": "",
@@ -829,6 +924,7 @@ for position, row_number in enumerate(rows_to_process, start=1):
                 row_number,
                 "gas",
                 {
+                    "success": True,
                     "meter_number": existing_mprn,
                     "transaction_id": "",
                     "error_code": "",
@@ -840,37 +936,14 @@ for position, row_number in enumerate(rows_to_process, start=1):
                 f"Excel row {row_number}: existing MPRN retained"
             )
         else:
-            result = lookup_meter(
-                session=session,
-                postcode=postcode,
-                address_identifier=address_identifier,
-                meter_type="gas",
-                request_timeout=int(request_timeout),
-                max_retries=int(max_retries),
+            lookup_tasks.append(
+                {
+                    "row_number": row_number,
+                    "meter_type": "gas",
+                    "postcode": postcode,
+                    "address_identifier": address_identifier,
+                }
             )
-            api_requests += 1
-            write_result(
-                worksheet,
-                row_number,
-                "gas",
-                result,
-                header_map,
-            )
-
-            if result["success"]:
-                gas_successes += 1
-                logs.append(
-                    f"Excel row {row_number}: MPRN "
-                    f"{result['meter_number']}"
-                )
-            else:
-                failed_lookups += 1
-                logs.append(
-                    f"Excel row {row_number}: gas – "
-                    f"{result['status']}"
-                )
-
-            time.sleep(float(request_delay))
     else:
         skipped_flags += 1
         write_result(
@@ -878,6 +951,7 @@ for position, row_number in enumerate(rows_to_process, start=1):
             row_number,
             "gas",
             {
+                "success": False,
                 "meter_number": existing_mprn,
                 "transaction_id": "",
                 "error_code": "",
@@ -886,8 +960,103 @@ for position, row_number in enumerate(rows_to_process, start=1):
             header_map,
         )
 
-    progress_bar.progress(position / total_rows)
-    live_log.code("\n".join(logs[-15:]), language=None)
+
+# ------------------------------------------------------------
+# PHASE 2: RUN API TASKS CONCURRENTLY
+# ------------------------------------------------------------
+
+total_api_tasks = len(lookup_tasks)
+completed_api_tasks = 0
+
+if total_api_tasks == 0:
+    progress_bar.progress(1.0)
+    current_status.success("No API requests were required.")
+
+else:
+    current_status.write(
+        f"Running {total_api_tasks} WiseWatt requests with "
+        f"{int(max_workers)} concurrent workers..."
+    )
+
+    with ThreadPoolExecutor(
+        max_workers=int(max_workers),
+        thread_name_prefix="wisewatt",
+    ) as executor:
+        future_to_task = {
+            executor.submit(
+                execute_lookup_task,
+                task,
+                api_key,
+                int(request_timeout),
+                int(max_retries),
+                float(request_delay),
+            ): task
+            for task in lookup_tasks
+        }
+
+        for future in as_completed(future_to_task):
+            task = future_to_task[future]
+            row_number = task["row_number"]
+            meter_type = task["meter_type"]
+
+            try:
+                completed = future.result()
+                result = completed["result"]
+                response_times.append(completed["elapsed_seconds"])
+
+            except Exception as exc:
+                result = {
+                    "success": False,
+                    "meter_number": "",
+                    "transaction_id": "",
+                    "error_code": "WORKER_ERROR",
+                    "status": f"Unexpected worker error – {exc}",
+                }
+
+            api_requests += 1
+            completed_api_tasks += 1
+
+            # Workbook writes occur only here, in the main Streamlit thread.
+            write_result(
+                worksheet,
+                row_number,
+                meter_type,
+                result,
+                header_map,
+            )
+
+            if result.get("success"):
+                if meter_type == "electricity":
+                    electricity_successes += 1
+                    meter_label = "MPAN"
+                else:
+                    gas_successes += 1
+                    meter_label = "MPRN"
+
+                logs.append(
+                    f"Excel row {row_number}: {meter_label} "
+                    f"{result.get('meter_number', '')}"
+                )
+            else:
+                failed_lookups += 1
+                logs.append(
+                    f"Excel row {row_number}: {meter_type} – "
+                    f"{result.get('status', 'Unknown error')}"
+                )
+
+            progress_bar.progress(
+                completed_api_tasks / total_api_tasks
+            )
+
+            current_status.write(
+                f"Completed {completed_api_tasks} of "
+                f"{total_api_tasks} API requests"
+            )
+
+            live_log.code(
+                "\n".join(logs[-15:]),
+                language=None,
+            )
 
 
 # ============================================================
@@ -902,6 +1071,20 @@ output_name = (
     f"{Path(uploaded_file.name).stem}_with_meter_numbers.xlsx"
 )
 
+batch_elapsed_seconds = time.perf_counter() - batch_started_at
+
+average_response_time = (
+    sum(response_times) / len(response_times)
+    if response_times
+    else 0.0
+)
+
+effective_requests_per_second = (
+    api_requests / batch_elapsed_seconds
+    if batch_elapsed_seconds > 0
+    else 0.0
+)
+
 progress_bar.progress(1.0)
 current_status.success("Processing complete.")
 
@@ -914,10 +1097,25 @@ result3.metric("Failed lookups", failed_lookups)
 result4.metric("Address-error rows", address_errors)
 result5.metric("API requests made", api_requests)
 
-detail1, detail2, detail3 = st.columns(3)
+detail1, detail2, detail3, detail4 = st.columns(4)
 detail1.metric("Empty rows ignored", max(ignored_empty_rows, 0))
 detail2.metric("Meter flags skipped", skipped_flags)
 detail3.metric("Existing numbers retained", skipped_existing)
+detail4.metric("Concurrent workers", int(max_workers))
+
+timing1, timing2, timing3 = st.columns(3)
+timing1.metric(
+    "Total processing time",
+    f"{batch_elapsed_seconds:.1f} sec",
+)
+timing2.metric(
+    "Average API response",
+    f"{average_response_time:.2f} sec",
+)
+timing3.metric(
+    "Effective request rate",
+    f"{effective_requests_per_second:.2f}/sec",
+)
 
 st.download_button(
     "Download updated workbook",

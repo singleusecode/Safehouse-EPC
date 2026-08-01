@@ -3,6 +3,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 from datetime import datetime, timedelta, timezone
 import os
+import time
 from pathlib import Path
 DEBUG = True
 def debug_print(*args):
@@ -32,6 +33,34 @@ def load_backup_data():
         df_raw["timestamp"].max(),
         "BACKUP_CSV"
     )
+
+def load_local_data():
+    """
+    Load previously saved processed CSV files only.
+
+    This function never contacts Octopus, Viper or any other API.
+    """
+    required_files = [
+        DATA_DIR / "aligned_30min.csv",
+        DATA_DIR / "aligned_30min_display.csv",
+        DATA_DIR / "aligned_hourly.csv",
+        DATA_DIR / "aligned_hourly_display.csv",
+    ]
+
+    missing_files = [
+        path.name
+        for path in required_files
+        if not path.exists()
+    ]
+
+    if missing_files:
+        raise FileNotFoundError(
+            "Missing local dashboard CSV files: "
+            + ", ".join(missing_files)
+        )
+
+    return load_backup_data()
+
 
 # -------------------------------------------------
 # STREAMLIT SUPPORT
@@ -101,42 +130,122 @@ def download_octopus(resource, mpxn, serial, start_date, end_date):
 # -------------------------------------------------
 # SENSOR DATA DOWNLOAD
 # -------------------------------------------------
-def download_viper_sensor_data(days=365):
+def download_viper_sensor_data(
+    days=365,
+    max_retries=3,
+    retry_delay=2.0,
+):
+    """
+    Download Viper sensor data with retries.
 
+    The Viper API may occasionally return HTTP 200 but contain
+    status='400' and api_data=null. Those responses are retried.
+    """
     url = get_secret("SENSOR_API_URL")
 
     params = {
         "key": get_secret("SENSOR_API_KEY"),
         "method": "3001",
         "eui": get_secret("SENSOR_EUI"),
-        # "parameters": "outside_humidity,co2,temperature,outside_temp,humidity,outside_pressure",
         "parameters": "temperature,humidity,co2",
         "sensorDescription": "Air Quality CO2",
         "technology_type": "lora",
         "token": get_secret("SENSOR_TOKEN"),
-        "days": str(days)
+        "days": str(days),
     }
 
-    debug_print("\n📡 SENSOR API REQUEST")
-    debug_print("PARAMS:", params)
+    last_error = "Unknown sensor API error"
 
-    response = requests.get(url, params=params, timeout=60)
+    for attempt in range(1, max_retries + 1):
+        try:
+            debug_print(
+                f"\n📡 SENSOR API REQUEST "
+                f"(attempt {attempt}/{max_retries})"
+            )
 
-    debug_print("STATUS:", response.status_code)
-    debug_print("RESPONSE (first 200 chars):", response.text[:200])
+            debug_print(
+                "REQUEST:",
+                {
+                    "parameters": params["parameters"],
+                    "sensorDescription": params["sensorDescription"],
+                    "technology_type": params["technology_type"],
+                    "days": params["days"],
+                },
+            )
 
-    response.raise_for_status()
+            response = requests.get(
+                url,
+                params=params,
+                timeout=60,
+            )
 
-    data = response.json()
-    payload = data.get("api_data", [])
+            debug_print("HTTP STATUS:", response.status_code)
+            response.raise_for_status()
 
-    if not payload:
-        raise ValueError("No sensor data")
+            data = response.json()
 
-    df = pd.DataFrame(payload)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+            api_status = str(data.get("status", ""))
+            api_error = data.get("error")
+            payload = data.get("api_data")
 
-    return df.sort_values("timestamp")
+            if (
+                api_status == "200"
+                and isinstance(payload, list)
+                and payload
+            ):
+                df = pd.DataFrame(payload)
+
+                if "timestamp" not in df.columns:
+                    raise ValueError(
+                        "Sensor response has no timestamp column"
+                    )
+
+                df["timestamp"] = pd.to_datetime(
+                    df["timestamp"],
+                    utc=True,
+                    errors="coerce",
+                )
+
+                df = df.dropna(subset=["timestamp"])
+
+                if df.empty:
+                    raise ValueError(
+                        "Sensor response has no valid timestamps"
+                    )
+
+                return df.sort_values("timestamp")
+
+            last_error = (
+                f"Viper status={api_status}; "
+                f"error={api_error}; "
+                f"api_data type={type(payload).__name__}"
+            )
+
+            debug_print(
+                "⚠ Invalid sensor response:",
+                last_error,
+            )
+
+        except requests.exceptions.Timeout:
+            last_error = "Sensor request timed out"
+
+        except requests.exceptions.RequestException as exc:
+            last_error = f"Sensor request failed: {exc}"
+
+        except ValueError as exc:
+            last_error = str(exc)
+
+        if attempt < max_retries:
+            delay = retry_delay * attempt
+            debug_print(
+                f"Retrying sensor request in {delay:.1f}s..."
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"Sensor API failed after {max_retries} attempts: "
+        f"{last_error}"
+    )
 
 
 # -------------------------------------------------
@@ -164,25 +273,91 @@ def build_dataset(days=365, save_csv=True):
     start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_str = end.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    api_failed = False
-    df_elec, df_gas, df_sensor = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    try:
-        df_elec = download_octopus("electricity", get_secret("MPAN"), get_secret("ELEC_SERIAL"), start_str, end_str)
-        df_gas = download_octopus("gas", get_secret("MPRN"), get_secret("GAS_SERIAL"), start_str, end_str)
-    except Exception:
-        api_failed = True
+    energy_api_failed = False
+    sensor_api_failed = False
 
+    df_elec = pd.DataFrame()
+    df_gas = pd.DataFrame()
     df_sensor = pd.DataFrame()
+    
     try:
-        df_sensor = download_viper_sensor_data(days)
-        df_sensor = df_sensor[
-            (df_sensor["timestamp"] >= start) &
-            (df_sensor["timestamp"] < end)
-        ]
-    except Exception as e:
-        debug_print("⚠ Sensor API failed:", e)
-        api_failed = True
+        df_elec = download_octopus(
+            "electricity",
+            get_secret("MPAN"),
+            get_secret("ELEC_SERIAL"),
+            start_str,
+            end_str,
+        )
 
+        df_gas = download_octopus(
+            "gas",
+            get_secret("MPRN"),
+            get_secret("GAS_SERIAL"),
+            start_str,
+            end_str,
+        )
+
+    except Exception as exc:
+        energy_api_failed = True
+        debug_print("⚠ Octopus API failed:", exc)
+
+    # df_sensor = pd.DataFrame()
+    # try:
+    #     df_sensor = download_viper_sensor_data(days)
+    #     df_sensor = df_sensor[
+    #         (df_sensor["timestamp"] >= start) &
+    #         (df_sensor["timestamp"] < end)
+    #     ]
+    # except Exception as e:
+    #     debug_print("⚠ Sensor API failed:", e)
+    #     api_failed = True
+
+    try:
+        df_sensor = download_viper_sensor_data(
+            days=days,
+            max_retries=3,
+            retry_delay=2.0,
+        )
+
+        df_sensor = df_sensor[
+            (df_sensor["timestamp"] >= start)
+            & (df_sensor["timestamp"] < end)
+        ]
+
+    except Exception as exc:
+        sensor_api_failed = True
+        debug_print("⚠ Sensor API failed:", exc)
+
+        raw_sensor_path = DATA_DIR / "raw_sensor.csv"
+
+        if raw_sensor_path.exists():
+            debug_print(
+                "Using previously saved local sensor data."
+            )
+
+            df_sensor = pd.read_csv(raw_sensor_path)
+
+            df_sensor["timestamp"] = pd.to_datetime(
+                df_sensor["timestamp"],
+                utc=True,
+                errors="coerce",
+            )
+
+            df_sensor = df_sensor.dropna(
+                subset=["timestamp"]
+            )
+
+            df_sensor = df_sensor[
+                (df_sensor["timestamp"] >= start)
+                & (df_sensor["timestamp"] < end)
+            ]
+
+        else:
+            debug_print(
+                "No local raw_sensor.csv is available."
+            )
+    
+    
     # -------------------------------------------------
     # SENSOR DATA SUMMARY
     # -------------------------------------------------
@@ -203,10 +378,25 @@ def build_dataset(days=365, save_csv=True):
     
     
     
-    if api_failed:
-        debug_print("⚠ API failed. Loading processed CSV backup instead.")
+    # if api_failed:
+    #     debug_print("⚠ API failed. Loading processed CSV backup instead.")
+    #     return load_backup_data()
+
+    if energy_api_failed:
+        debug_print(
+            "⚠ Energy API failed. "
+            "Loading processed CSV backup instead."
+        )
         return load_backup_data()
 
+    if df_sensor.empty:
+        debug_print(
+            "⚠ Sensor data unavailable. "
+            "Loading processed CSV backup instead."
+        )
+        return load_backup_data()
+    
+    
     if save_csv:
         df_elec.to_csv(DATA_DIR / "raw_electricity.csv", index=False)
         df_gas.to_csv(DATA_DIR / "raw_gas.csv", index=False)
@@ -361,7 +551,21 @@ def build_dataset(days=365, save_csv=True):
                 df_combined["timestamp"].max())
 
     debug_print("Total energy:", df_combined["total_energy"].sum())
-    
+    if sensor_api_failed:
+        source_label = "LIVE_ENERGY_LOCAL_SENSOR"
+    else:
+        source_label = "LIVE_API"
+
+    return (
+        df_combined,
+        df_display,
+        df_hourly,
+        df_hourly_display,
+        df_elec,
+        df_gas,
+        end,
+        source_label,
+)
     # return df_combined, df_display, df_hourly_display, df_elec, df_gas, end
     return (
     df_combined,
@@ -371,16 +575,37 @@ def build_dataset(days=365, save_csv=True):
     df_elec,
     df_gas,
     end,
-    "LIVE_API"
+    source_label,
 )
+def load_data(
+    days=365,
+    refresh_key=0,
+    use_api=False,
+):
+    """
+    Load dashboard data without automatically contacting external APIs.
 
-@cache_decorator(ttl=3600)
-def load_data(days=365, refresh_key=0):
-    return build_dataset(days=days, save_csv=False)
+    Parameters
+    ----------
+    days:
+        Number of days requested when refreshing API data.
+
+    refresh_key:
+        Retained for compatibility with the dashboard.
+
+    use_api:
+        When True, download fresh API data and save processed CSV files.
+        When False, read existing local CSV files only.
+    """
+      
+    return load_local_data()
 
 
 if __name__ == "__main__":
-
-    df_raw, df_display, df_hourly, *_ = build_dataset(days=365, save_csv=True)
+    # Running data_loader.py directly is an explicit API refresh.
+    df_raw, df_display, df_hourly, *_ = build_dataset(
+        days=365,
+        save_csv=True,
+    )
 
     print("Total energy:", df_raw["total_energy"].sum())

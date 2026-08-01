@@ -23,4 +23,3 @@ List of Files
 
 Notes
 1. API keys and live data access have been removed for submission.
-2. Sample datasets are provided in the csv_data folder to allow the system to run.
